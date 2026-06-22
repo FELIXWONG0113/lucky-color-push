@@ -1,4 +1,4 @@
-name: 每日幸运色推送
+name: Lucky Color Push
 
 on:
   schedule:
