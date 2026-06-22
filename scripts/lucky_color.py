@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 每日幸运色微信推送脚本
-- 主数据源：问运势网五行穿衣指南
-- 补充数据源：小红书搜索（容错，失败不影响推送）
+- 主数据源1：问运势网五行穿衣指南
+- 主数据源2：pmdy.cn（备用，问运势网不可用时自动切换）
+- 算法备用：基于天干地支五行生克自动计算（网站都不可用时使用）
 - 推送渠道：PushPlus → 微信
 """
 
 import os
 import sys
+import re
 import json
 import requests
 from datetime import datetime, timedelta, timezone
@@ -18,12 +20,22 @@ from bs4 import BeautifulSoup
 PUSHPLUS_API = "http://www.pushplus.plus/send"
 BJT = timezone(timedelta(hours=8))
 
+# 通用请求头（更完整，减少被拦截概率）
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+}
+
 # 颜色名称 → CSS 颜色值映射
 COLOR_MAP = {
     "黑色": "#000000",
     "蓝色": "#0066cc",
     "白色": "#ffffff",
     "银色": "#c0c0c0",
+    "金黄": "#ffd700",
     "米白": "#f5f5dc",
     "灰色": "#808080",
     "红色": "#dc3545",
@@ -32,40 +44,73 @@ COLOR_MAP = {
     "橙红": "#ff6347",
     "绿色": "#28a745",
     "青色": "#17a2b8",
+    "苍青": "#2e8b57",
     "青绿": "#20c997",
     "翠绿": "#00d084",
     "黄色": "#ffc107",
     "咖色": "#8b4513",
     "棕色": "#a0522d",
     "褐色": "#800000",
+    "米黄": "#f0e68c",
+    "驼色": "#c19a6b",
     "橙黄": "#fd7e14",
 }
 
+# 五行 → 颜色系映射
+WUXING_COLORS = {
+    "金": ["白色", "银色", "灰色", "米白"],
+    "木": ["绿色", "青色", "苍青", "翠绿"],
+    "水": ["黑色", "蓝色"],
+    "火": ["红色", "紫色", "粉色", "橙红"],
+    "土": ["黄色", "咖色", "棕色", "褐色", "橙黄"],
+}
+
+# 五行相生：A生B → A → B
+SHENG = {"木": "火", "火": "土", "土": "金", "金": "水", "水": "木"}
+
+# 五行相克：A克B → A → B
+KE = {"金": "木", "木": "土", "土": "水", "水": "火", "火": "金"}
+
+# 地支 → 五行
+DIZHI_WUXING = {
+    "子": "水", "丑": "土", "寅": "木", "卯": "木",
+    "辰": "土", "巳": "火", "午": "火", "未": "土",
+    "申": "金", "酉": "金", "戌": "土", "亥": "水",
+}
+
+# 天干 → 五行
+TIANGAN_WUXING = {
+    "甲": "木", "乙": "木", "丙": "火", "丁": "火",
+    "戊": "土", "己": "土", "庚": "金", "辛": "金",
+    "壬": "水", "癸": "水",
+}
+
+# 天干列表（用于计算日柱）
+TIANGAN_LIST = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
+DIZHI_LIST = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+
 # 颜色等级配置
 LEVEL_CONFIG = {
-    "daji":     {"label": "大吉 · 贵人色", "gradient": "linear-gradient(135deg,#2d8f4e,#1b5e20)", "accent": "#2d8f4e", "icon": "✦"},
-    "ciji":     {"label": "次吉 · 合作色", "gradient": "linear-gradient(135deg,#0097a7,#006064)", "accent": "#0097a7", "icon": "◇"},
-    "pingping": {"label": "平平 · 招财色", "gradient": "linear-gradient(135deg,#c99700,#8b6914)", "accent": "#c99700", "icon": "○"},
-    "shenyong": {"label": "慎用 · 消耗色", "gradient": "linear-gradient(135deg,#e65100,#bf360c)", "accent": "#e65100", "icon": "△"},
-    "jiyong":   {"label": "忌用 · 不利色", "gradient": "linear-gradient(135deg,#c62828,#8e0000)", "accent": "#c62828", "icon": "✕"},
+    "daji":     {"label": "大吉 · 贵人色"},
+    "ciji":     {"label": "次吉 · 合作色"},
+    "pingping": {"label": "平平 · 招财色"},
+    "shenyong": {"label": "慎用 · 消耗色"},
+    "jiyong":   {"label": "忌用 · 不利色"},
 }
 
 
 # ===== 数据爬取 =====
 
-def fetch_wuxing_data(date_str):
-    """爬取并解析五行穿衣网站数据"""
+def fetch_wenyunshi(date_str):
+    """爬取问运势网五行穿衣数据"""
     url = f"https://www.wenyunshi.com/sm/wuxingchuanyi/{date_str}.html"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.wenyunshi.com/sm/wuxingchuanyi/",
-    }
+    headers = {**COMMON_HEADERS, "Referer": "https://www.wenyunshi.com/sm/wuxingchuanyi/"}
 
     resp = requests.get(url, headers=headers, timeout=15)
     resp.encoding = "utf-8"
 
     if resp.status_code != 200:
-        raise Exception(f"五行穿衣网站请求失败，状态码: {resp.status_code}")
+        raise Exception(f"问运势网请求失败，状态码: {resp.status_code}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     data = {}
@@ -90,41 +135,16 @@ def fetch_wuxing_data(date_str):
     for class_name, config in LEVEL_CONFIG.items():
         block = soup.select_one(f".color-recommend.{class_name}")
         if not block:
-            colors[class_name] = {
-                "label": config["label"],
-                "effect": "",
-                "colors": [],
-                "summary": "",
-                "yuyi": "",
-                "jieshi": "",
-            }
+            colors[class_name] = {"label": config["label"], "effect": "", "colors": [], "yuyi": ""}
             continue
 
-        # 颜色名称列表
         color_names = [cn.get_text(strip=True) for cn in block.select(".color-name")]
-
-        # 效果文字
         effect_el = block.select_one(".recommend-effect")
         effect = effect_el.get_text(strip=True) if effect_el else ""
-
-        # 颜色汇总
-        summary_el = block.select_one(".color-summary")
-        summary = summary_el.get_text(strip=True) if summary_el else ""
-
-        # 寓意和解释
         yuyi_el = block.select_one(".yuyi-text")
-        jieshi_el = block.select_one(".jieshi-text")
         yuyi = yuyi_el.get_text(strip=True) if yuyi_el else ""
-        jieshi = jieshi_el.get_text(strip=True) if jieshi_el else ""
 
-        colors[class_name] = {
-            "label": config["label"],
-            "effect": effect,
-            "colors": color_names,
-            "summary": summary,
-            "yuyi": yuyi,
-            "jieshi": jieshi,
-        }
+        colors[class_name] = {"label": config["label"], "effect": effect, "colors": color_names, "yuyi": yuyi}
     data["colors"] = colors
 
     # 4. 宜忌
@@ -139,41 +159,179 @@ def fetch_wuxing_data(date_str):
     data["sheng"] = sheng_el.get_text(strip=True) if sheng_el else ""
     data["ke"] = ke_el.get_text(strip=True) if ke_el else ""
 
+    data["source"] = "问运势网"
     return data
 
 
-def search_xiaohongshu():
-    """尝试搜索小红书，失败返回空列表（不影响主流程）"""
+def fetch_pmdy(date_str):
+    """爬取 pmdy.cn 五行穿衣数据（备用数据源）"""
+    url = f"https://www.pmdy.cn/day/{date_str}.html"
+    headers = {**COMMON_HEADERS, "Referer": "https://www.pmdy.cn/"}
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.encoding = "utf-8"
+
+    if resp.status_code != 200:
+        raise Exception(f"pmdy.cn请求失败，状态码: {resp.status_code}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(separator="\n")  # 纯文本，去除所有HTML标签
+
+    data = {}
+
+    # 用正则解析纯文本格式的颜色数据
+    # 格式: 1、大吉色（贵人色）：白色、银色、灰色、米白，解释：...
+    patterns = {
+        "daji":     r"1[、.]\s*大吉色[^：]*[：:]\s*([^，,解释]+)",
+        "ciji":     r"2[、.]\s*次吉色[^：]*[：:]\s*([^，,寓意]+)",
+        "pingping": r"3[、.]\s*平平色[^：]*[：:]\s*([^，,寓意]+)",
+        "shenyong": r"4[、.]\s*慎用色[^：]*[：:]\s*([^，,寓意]+)",
+        "jiyong":   r"5[、.]\s*忌用色[^：]*[：:]\s*([^，,寓意]+)",
+    }
+
+    colors = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            color_str = match.group(1).strip()
+            color_names = [c.strip() for c in color_str.split("、") if c.strip()]
+        else:
+            color_names = []
+        colors[key] = {"label": LEVEL_CONFIG[key]["label"], "effect": "", "colors": color_names, "yuyi": ""}
+    data["colors"] = colors
+
+    # 解析日期信息
+    date_match = re.search(r"今天是公历[：:]\s*(\d+年\d+月\d+日)", text)
+    lunar_match = re.search(r"农历[：:]\s*([二〇一二三四五六七八九十]+月[初正一二三四五六七八九十]+)", text)
+    ganzhi_match = re.search(r"天干地支为[：:]\s*([\u4e00-\u9fff]+年[\u4e00-\u9fff]+月[\u4e00-\u9fff]+日)", text)
+
+    data["solar_date"] = date_match.group(1) if date_match else date_str
+    data["lunar_date"] = lunar_match.group(1) if lunar_match else ""
+
+    # 解析干支
+    ganzhi = {}
+    if ganzhi_match:
+        gz_str = ganzhi_match.group(1)
+        gz_parts = re.findall(r"([\u4e00-\u9fff]{2,3})", gz_str)
+        if len(gz_parts) >= 3:
+            ganzhi["干支年柱"] = gz_parts[0]
+            ganzhi["干支月柱"] = gz_parts[1]
+            ganzhi["干支日柱"] = gz_parts[2]
+
+    # 日干五行
+    wuxing_match = re.search(r"日地支五行为[：:]\s*([\u4e00-\u9fff]+)", text)
+    if wuxing_match:
+        ganzhi["日干五行"] = wuxing_match.group(1)
+    data["ganzhi"] = ganzhi
+
+    # 解析宜忌
+    yi_match = re.search(r"今日黄历宜[：:]\s*([^\n<>]+)", text)
+    ji_match = re.search(r"今日黄历忌[：:]\s*([^\n<>]+)", text)
+    data["yi"] = yi_match.group(1).strip().split() if yi_match else []
+    data["ji"] = ji_match.group(1).strip().split() if ji_match else []
+
+    # 大吉寓意
+    daji_yuyi_match = re.search(r"1[、.]\s*大吉色[^：]*[：:][^，,]+[，,]解释[：:]\s*([^。]+)", text)
+    if daji_yuyi_match and colors["daji"]["colors"]:
+        colors["daji"]["yuyi"] = daji_yuyi_match.group(1).strip()
+
+    data["sheng"] = ""
+    data["ke"] = ""
+    data["source"] = "pmdy.cn"
+    return data
+
+
+def calculate_wuxing_algorithmically(date_str):
+    """基于天干地支五行生克理论，纯算法计算幸运色（终极备用）"""
     try:
-        keywords = ["明日幸运色穿搭", "今日穿搭幸运色"]
-        results = []
+        parts = date_str.split("-")
+        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+    except (ValueError, IndexError):
+        raise Exception(f"日期格式错误: {date_str}")
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
+    # 计算日柱的天干地支
+    # 基于已知基准日：2024年1月1日 = 甲子日（干支序号0）
+    # 实际使用一个可靠的基准：2000年1月7日为甲子日
+    base_date = datetime(2000, 1, 7)
+    target_date = datetime(year, month, day)
+    days_diff = (target_date - base_date).days
 
-        # 尝试访问小红书搜索页面（反爬严格，很可能失败）
-        url = "https://www.xiaohongshu.com/search_result"
-        params = {"keyword": keywords[0], "source": "web_search_result_notes"}
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+    # 干支60甲子循环
+    ganzhi_index = days_diff % 60
+    tiangan_index = ganzhi_index % 10
+    dizhi_index = ganzhi_index % 12
 
-        if resp.status_code != 200:
-            return []
+    day_tiangan = TIANGAN_LIST[tiangan_index]
+    day_dizhi = DIZHI_LIST[dizhi_index]
+    day_wuxing = DIZHI_WUXING[day_dizhi]
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # 尝试提取搜索结果中的笔记标题
-        for note in soup.select(".note-item"):
-            title_el = note.select_one(".title")
-            if title_el:
-                title = title_el.get_text(strip=True)
-                if any(kw in title for kw in ["幸运色", "穿搭", "颜色", "五行穿衣", "旺运"]):
-                    results.append({"title": title, "desc": ""})
+    # 根据五行生克规则确定各等级颜色
+    # 大吉：被当日五行生 → 当日五行所生的元素
+    daji_wuxing = SHENG[day_wuxing]
+    # 次吉：与当日五行同 → 同元素
+    ciji_wuxing = day_wuxing
+    # 平平：克当日五行 → 能克制当日五行的元素
+    pingping_wuxing = None
+    for wx, target in KE.items():
+        if target == day_wuxing:
+            pingping_wuxing = wx
+            break
+    # 慎用：生当日五行 → 生成当日五行的元素（消耗）
+    shenyong_wuxing = None
+    for wx, target in SHENG.items():
+        if target == day_wuxing:
+            shenyong_wuxing = wx
+            break
+    # 忌用：被当日五行克 → 当日五行所克制的元素
+    jiyong_wuxing = KE[day_wuxing]
 
-        return results[:3]  #最多取3条
+    colors = {
+        "daji":     {"label": LEVEL_CONFIG["daji"]["label"], "effect": "", "colors": WUXING_COLORS[daji_wuxing], "yuyi": f"五行{day_wuxing}生{daji_wuxing}，易获贵人扶助，事半功倍"},
+        "ciji":     {"label": LEVEL_CONFIG["ciji"]["label"], "effect": "", "colors": WUXING_COLORS[ciji_wuxing], "yuyi": f"与当日五行同属{ciji_wuxing}，幸运眷顾，行事顺利"},
+        "pingping": {"label": LEVEL_CONFIG["pingping"]["label"], "effect": "", "colors": WUXING_COLORS[pingping_wuxing] if pingping_wuxing else [], "yuyi": ""},
+        "shenyong": {"label": LEVEL_CONFIG["shenyong"]["label"], "effect": "", "colors": WUXING_COLORS[shenyong_wuxing] if shenyong_wuxing else [], "yuyi": ""},
+        "jiyong":   {"label": LEVEL_CONFIG["jiyong"]["label"], "effect": "", "colors": WUXING_COLORS[jiyong_wuxing] if jiyong_wuxing else [], "yuyi": ""},
+    }
 
-    except Exception as e:
-        print(f"[WARN] 小红书搜索失败(不影响推送): {e}")
-        return []
+    # 干支信息
+    ganzhi = {
+        "干支日柱": f"{day_tiangan}{day_dizhi}",
+        "日干五行": day_wuxing,
+    }
+
+    data = {
+        "solar_date": f"{year}年{month}月{day}日",
+        "lunar_date": "",
+        "ganzhi": ganzhi,
+        "colors": colors,
+        "yi": [],
+        "ji": [],
+        "sheng": f"{day_wuxing}生{daji_wuxing}",
+        "ke": f"{day_wuxing}克{jiyong_wuxing}",
+        "source": "算法计算",
+    }
+    return data
+
+
+def fetch_wuxing_data(date_str):
+    """尝试多个数据源获取五行穿衣数据，自动容错切换"""
+    sources = [
+        ("问运势网", fetch_wenyunshi),
+        ("pmdy.cn", fetch_pmdy),
+        ("算法计算", calculate_wuxing_algorithmically),
+    ]
+
+    for source_name, fetch_func in sources:
+        try:
+            print(f"[INFO] 尝试数据源: {source_name}...")
+            data = fetch_func(date_str)
+            print(f"[OK] {source_name} 数据获取成功: {data.get('solar_date', date_str)}")
+            return data
+        except Exception as e:
+            print(f"[WARN] {source_name} 获取失败: {e}")
+            continue
+
+    raise Exception("所有数据源均获取失败")
 
 
 # ===== HTML 消息生成（极简风格 - 参考iOS卡片设计） =====
@@ -237,10 +395,12 @@ def generate_html(data, xhs_notes):
 
     # 干支信息
     gz = data.get("ganzhi", {})
-    gz_text = f"{gz.get('干支年柱', '')}年 {gz.get('干支月柱', '')}月 {gz.get('干支日柱', '')}日 · 五行{gz.get('日干五行', '')}"
+    gz_day = gz.get("干支日柱", "")
+    gz_wuxing = gz.get("日干五行", "")
+    gz_text = f"{gz_day}日 · 五行{gz_wuxing}" if gz_day else ""
 
     # 穿搭建议文案
-    tip_text = daji_yuyi or data["colors"]["daji"].get("effect", "")
+    tip_text = daji_yuyi or daji_data.get("effect", "")
     suggestion_html = ""
     if tip_text:
         suggestion_html = f'''
@@ -290,7 +450,7 @@ def generate_html(data, xhs_notes):
         <div style="width:30px;height:3px;background:linear-gradient(90deg,#667eea,#a855f7);
                     border-radius:2px;margin:22px auto;"></div>
 
-        <!-- 搭配推荐 -->
+        <!-- 备选颜色 -->
         <div style="padding:0 10px;margin-bottom:4px;">
             <div style="font-size:12px;color:#bbb;margin-bottom:10px;letter-spacing:1px;">
                 ✦ 备选颜色
@@ -302,7 +462,7 @@ def generate_html(data, xhs_notes):
 
         <!-- 底部 -->
         <div style="text-align:center;padding:20px 0 4px;font-size:10px;color:#ccc;letter-spacing:0.5px;">
-            数据来源：问运势网 · {gz_text}<br/>
+            数据来源：{data.get('source', '综合')} · {gz_text}<br/>
             每日 21:00 自动推送
         </div>
     </div>'''
@@ -348,28 +508,20 @@ def main():
     date_str = f"{tomorrow.year}-{tomorrow.month}-{tomorrow.day}"
     title = f"{tomorrow.month}月{tomorrow.day}日幸运色指南"
 
-    # 3. 爬取五行穿衣数据
+    # 3. 爬取五行穿衣数据（多数据源自动容错）
     print(f"[INFO] 正在获取明天({date_str})的五行穿衣数据...")
     try:
         data = fetch_wuxing_data(date_str)
-        print(f"[OK] 数据获取成功: {data['solar_date']}")
+        print(f"[OK] 数据获取成功，来源: {data.get('source', '未知')}")
     except Exception as e:
-        print(f"[FAIL] 五行穿衣数据获取失败: {e}")
+        print(f"[FAIL] 所有数据源均获取失败: {e}")
         sys.exit(1)
 
-    # 4. 尝试搜索小红书（容错）
-    print("[INFO] 尝试搜索小红书补充数据...")
-    xhs_notes = search_xiaohongshu()
-    if xhs_notes:
-        print(f"[OK] 小红书获取到 {len(xhs_notes)} 条建议")
-    else:
-        print("[INFO] 小红书搜索无结果(不影响推送)")
-
-    # 5. 生成HTML推送内容
-    html_content = generate_html(data, xhs_notes)
+    # 4. 生成HTML推送内容
+    html_content = generate_html(data, [])
     print("[OK] HTML内容生成完成")
 
-    # 6. 推送到微信
+    # 5. 推送到微信
     print(f"[INFO] 正在推送到微信，标题: {title}")
     push_message(token, title, html_content)
 
