@@ -175,7 +175,7 @@ def fetch_pmdy(date_str):
         raise Exception(f"pmdy.cn请求失败，状态码: {resp.status_code}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text(separator="\n")  # 纯文本，去除所有HTML标签
+    text = soup.get_text(separator="")  # 纯文本，无换行，便于正则连续匹配
 
     data = {}
 
@@ -230,10 +230,15 @@ def fetch_pmdy(date_str):
     data["yi"] = yi_match.group(1).strip().split() if yi_match else []
     data["ji"] = ji_match.group(1).strip().split() if ji_match else []
 
-    # 大吉寓意
-    daji_yuyi_match = re.search(r"1[、.]\s*大吉色[^：]*[：:][^，,]+[，,]解释[：:]\s*([^。]+)", text)
-    if daji_yuyi_match and colors["daji"]["colors"]:
-        colors["daji"]["yuyi"] = daji_yuyi_match.group(1).strip()
+    # 大吉寓意：从"解释："起，到下一个编号段落或末尾
+    yuyi_match = re.search(r"解释[：:](.+?)(?:\n+\d[、.]|$)", text, re.DOTALL)
+    if yuyi_match:
+        raw_yuyi = yuyi_match.group(1).strip()
+        # 清理多余换行，截取前80字
+        raw_yuyi = re.sub(r'\s+', '', raw_yuyi)
+        if len(raw_yuyi) > 80:
+            raw_yuyi = raw_yuyi[:80] + "..."
+        colors["daji"]["yuyi"] = raw_yuyi
 
     data["sheng"] = ""
     data["ke"] = ""
@@ -399,17 +404,7 @@ def generate_html(data, xhs_notes):
     gz_wuxing = gz.get("日干五行", "")
     gz_text = f"{gz_day}日 · 五行{gz_wuxing}" if gz_day else ""
 
-    # 穿搭建议文案
-    tip_text = daji_yuyi or daji_data.get("effect", "")
-    suggestion_html = ""
-    if tip_text:
-        suggestion_html = f'''
-        <div style="background-color:#fafafa;border-radius:14px;padding:16px 18px;
-                    margin-top:24px;border-left:3px solid #7c7ce0;">
-            <div style="font-size:13px;color:#666;line-height:1.9;">
-                <span style="color:#999;margin-right:4px;">💡</span>{tip_text}
-            </div>
-        </div>'''
+    # 穿搭建议文案（已移除，不再显示）
 
     html = f'''<div style="font-family:-apple-system,'PingFang SC','Helvetica Neue',sans-serif;
                 max-width:380px;margin:0 auto;padding:16px;background-color:#fff;">
@@ -457,8 +452,6 @@ def generate_html(data, xhs_notes):
             </div>
             {match_table}
         </div>
-
-        {suggestion_html}
 
         <!-- 底部 -->
         <div style="text-align:center;padding:20px 0 4px;font-size:10px;color:#ccc;letter-spacing:0.5px;">
